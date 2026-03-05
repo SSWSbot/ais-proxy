@@ -10,10 +10,14 @@ console.log(`AIS Proxy listening on port ${PORT}`);
 wss.on("connection", (client) => {
   console.log("Browser connected");
 
+  let messageBuffer = [];
   const upstream = new WebSocket(AIS_URL);
 
   upstream.on("open", () => {
     console.log("Connected to aisstream.io");
+    // Send any messages that arrived before upstream was ready
+    messageBuffer.forEach(msg => upstream.send(msg));
+    messageBuffer = [];
   });
 
   // Forward messages from aisstream → browser
@@ -24,10 +28,12 @@ wss.on("connection", (client) => {
   });
 
   // Forward messages from browser → aisstream
-  // (this sends your API key + bounding box)
+  // Buffer them if upstream isn't open yet
   client.on("message", (data) => {
     if (upstream.readyState === WebSocket.OPEN) {
       upstream.send(data);
+    } else {
+      messageBuffer.push(data);
     }
   });
 

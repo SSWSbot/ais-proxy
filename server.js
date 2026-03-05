@@ -43,7 +43,7 @@ wss.on("connection", (client) => {
       console.log("Data flowing normally — suppressing further logs");
     }
     if (client.readyState === WebSocket.OPEN) {
-      client.send(data);
+      client.send(data.toString());
     }
   });
 

@@ -1,10 +1,18 @@
 const http = require("http");
+const https = require("https");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
 const AIS_URL = "wss://stream.aisstream.io/v0/stream";
 const API_KEY = "3e9c100a314a16a7df2a9364b1a7f8cfa775e478";
 const BBOX = [[47.0, -126.5], [51.0, -121.5]];
+
+// ── MyShipTracking config (second AIS source for WW Fleet) ──
+// Set MST_API_KEY in Render environment variables
+const MST_KEY = process.env.MST_API_KEY || "";
+const MST_POLL_INTERVAL_MS = 5 * 60 * 1000;   // Poll every 5 minutes
+const MST_STALE_THRESHOLD_MS = 15 * 60 * 1000; // Only poll MMSIs not seen by AISstream in 15 min
+const MST_BATCH_SIZE = 100;                     // Max MMSIs per MyShipTracking bulk request
 
 // ── WW Fleet MMSI list (mirrored from frontend for diagnostics) ──
 const WW_MMSI = {
@@ -48,9 +56,11 @@ const CACHE_TTL_MS = 30 * 60 * 1000;
 
 // ── Diagnostics tracking ──
 const messageTypeCounts = {};
-const wwSeen = {};
+const wwSeen = {};       // tracks AISstream sightings
+const wwSeenMST = {};    // tracks MyShipTracking sightings
 let totalMessages = 0;
 let upstreamConnectedAt = null;
+let mstStats = { polls: 0, creditsUsed: 0, vesselsQueried: 0, vesselsReturned: 0, errors: 0, lastPoll: null };
 
 // Clean stale cache entries every 5 minutes
 setInterval(() => {
@@ -135,12 +145,175 @@ function updateCache(raw) {
         speed:   speed   != null ? speed   : null,
         heading: heading != null ? heading : null,
         aisClass: aisClass || (prev && prev.aisClass) || null,
+        source: "aisstream",
         timestamp: Date.now()
       };
     }
   } catch (e) {
     // Ignore malformed messages
   }
+}
+
+// ═══════════════════════════════════════════════════
+// ── MyShipTracking Poller (second AIS source for WW Fleet) ──
+// ═══════════════════════════════════════════════════
+// Only queries WW fleet vessels that AISstream hasn't delivered recently.
+// This saves credits — we only pay for vessels MST actually finds.
+
+function getStaleWWMMSIs() {
+  const cutoff = Date.now() - MST_STALE_THRESHOLD_MS;
+  const stale = [];
+  for (const mmsi in WW_MMSI) {
+    const cached = vesselCache[mmsi];
+    // Include if: not in cache, OR last update was from MST (keep refreshing), OR AISstream data is stale
+    if (!cached || cached.source === "myshiptracking" || cached.timestamp < cutoff) {
+      stale.push(mmsi);
+    }
+  }
+  return stale;
+}
+
+function fetchMST(mmsiList) {
+  return new Promise((resolve, reject) => {
+    const url = `https://api.myshiptracking.com/api/v2/vessel/bulk?mmsi=${mmsiList.join(",")}`;
+    const options = {
+      headers: { "Authorization": `Bearer ${MST_KEY}` }
+    };
+    https.get(url, options, (res) => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("end", () => {
+        if (res.statusCode !== 200) {
+          reject(new Error(`MST API returned ${res.statusCode}: ${body.slice(0, 300)}`));
+          return;
+        }
+        try {
+          const parsed = JSON.parse(body);
+          // MST wraps data in { status, data: [...] }
+          if (parsed.status === "success" && Array.isArray(parsed.data)) {
+            // Check credit header
+            const charged = res.headers["x-credit-charged"];
+            if (charged) mstStats.creditsUsed += parseInt(charged) || 0;
+            resolve(parsed.data);
+          } else if (parsed.status === "error") {
+            reject(new Error("MST error: " + (parsed.message || JSON.stringify(parsed))));
+          } else {
+            resolve([]);
+          }
+        } catch (e) {
+          reject(new Error("MST JSON parse error: " + e.message));
+        }
+      });
+    }).on("error", reject);
+  });
+}
+
+async function pollMST() {
+  if (!MST_KEY) return;
+
+  const staleMMSIs = getStaleWWMMSIs();
+  if (staleMMSIs.length === 0) {
+    console.log("MST poll: all WW vessels covered by AISstream, skipping.");
+    return;
+  }
+
+  // Split into batches of 100
+  const batches = [];
+  for (let i = 0; i < staleMMSIs.length; i += MST_BATCH_SIZE) {
+    batches.push(staleMMSIs.slice(i, i + MST_BATCH_SIZE));
+  }
+
+  console.log(`MST poll: querying ${staleMMSIs.length} stale WW vessels in ${batches.length} batch(es)...`);
+  mstStats.polls++;
+  mstStats.lastPoll = new Date().toISOString();
+
+  for (const batch of batches) {
+    try {
+      mstStats.vesselsQueried += batch.length;
+      const results = await fetchMST(batch);
+      if (!Array.isArray(results)) continue;
+
+      let count = 0;
+      for (const v of results) {
+        const mmsiStr = String(v.mmsi);
+        const lat = v.lat;
+        const lng = v.lng;
+        if (!lat || !lng) continue;
+
+        // Skip if AISstream delivered a fresher update since we started
+        const existing = vesselCache[mmsiStr];
+        if (existing && existing.source === "aisstream" && existing.timestamp > Date.now() - MST_STALE_THRESHOLD_MS) {
+          continue;
+        }
+
+        const heading = (v.course != null && v.course < 360) ? Math.round(v.course) : null;
+        const speed = v.speed != null ? v.speed : null;
+        const name = v.vessel_name || WW_MMSI[mmsiStr] || "Unknown";
+
+        // Update cache
+        vesselCache[mmsiStr] = {
+          mmsi: mmsiStr,
+          lat, lng, name,
+          speed, heading,
+          aisClass: "B",
+          source: "myshiptracking",
+          timestamp: Date.now()
+        };
+
+        // Track for diagnostics
+        wwSeenMST[mmsiStr] = {
+          name,
+          lastSeen: new Date().toISOString(),
+          lat, lng, speed, heading,
+          mstTimestamp: v.received || null
+        };
+
+        // Broadcast to browsers as AISstream-format message
+        const syntheticMsg = JSON.stringify({
+          MetaData: {
+            MMSI: parseInt(mmsiStr),
+            latitude: lat,
+            longitude: lng,
+            ShipName: name
+          },
+          Message: {
+            PositionReport: {
+              Latitude: lat,
+              Longitude: lng,
+              Sog: speed,
+              TrueHeading: heading != null ? heading : 511,
+              Cog: v.course != null ? v.course : 360
+            }
+          }
+        });
+        wss.clients.forEach((client) => {
+          if (client.readyState === WebSocket.OPEN) {
+            client.send(syntheticMsg);
+          }
+        });
+
+        count++;
+      }
+
+      mstStats.vesselsReturned += count;
+      if (count > 0) {
+        console.log(`MST poll: got ${count} positions (batch of ${batch.length}). Total credits used: ~${mstStats.creditsUsed}`);
+      }
+    } catch (e) {
+      mstStats.errors++;
+      console.error("MST poll error:", e.message);
+    }
+  }
+}
+
+// Start MyShipTracking polling
+if (MST_KEY) {
+  console.log("MyShipTracking integration ENABLED — polling every " + (MST_POLL_INTERVAL_MS / 60000) + " min");
+  // First poll after 30 seconds (let AISstream populate first)
+  setTimeout(pollMST, 30 * 1000);
+  setInterval(pollMST, MST_POLL_INTERVAL_MS);
+} else {
+  console.log("MyShipTracking integration DISABLED — set MST_API_KEY env var to enable");
 }
 
 // ── HTTP server ──
@@ -170,8 +343,16 @@ const server = http.createServer((req, res) => {
     const wwMissingList = [];
 
     for (const mmsi in WW_MMSI) {
-      if (wwSeen[mmsi]) {
-        wwSeenList.push({ mmsi, name: WW_MMSI[mmsi], ...wwSeen[mmsi] });
+      const fromAIS = wwSeen[mmsi] || null;
+      const fromMST = wwSeenMST[mmsi] || null;
+      const inCache = vesselCache[mmsi] || null;
+      if (fromAIS || fromMST || inCache) {
+        wwSeenList.push({
+          mmsi, name: WW_MMSI[mmsi],
+          ...(fromAIS || {}),
+          myShipTracking: fromMST || null,
+          cacheSource: inCache ? inCache.source : null
+        });
       } else {
         wwMissingList.push({ mmsi, name: WW_MMSI[mmsi] });
       }
@@ -189,9 +370,16 @@ const server = http.createServer((req, res) => {
         uptimeMinutes: upstreamConnectedAt ? Math.round((Date.now() - new Date(upstreamConnectedAt).getTime()) / 60000) : null
       },
       messageTypes: messageTypeCounts,
+      myShipTracking: {
+        enabled: !!MST_KEY,
+        pollIntervalMin: MST_POLL_INTERVAL_MS / 60000,
+        ...mstStats
+      },
       wwFleet: {
         total: wwTotal,
         seen: wwSeenList.length,
+        seenByAISstream: Object.keys(wwSeen).length,
+        seenByMyShipTracking: Object.keys(wwSeenMST).length,
         missing: wwMissingList.length,
         seenVessels: wwSeenList,
         missingVessels: wwMissingList
@@ -210,8 +398,11 @@ const server = http.createServer((req, res) => {
       status: "ok",
       vessels: Object.keys(vesselCache).length,
       wwSeen: Object.keys(wwSeen).length,
+      wwSeenMST: Object.keys(wwSeenMST).length,
       wwTotal: Object.keys(WW_MMSI).length,
-      upstreamConnected: upstream && upstream.readyState === WebSocket.OPEN
+      upstreamConnected: upstream && upstream.readyState === WebSocket.OPEN,
+      myShipTrackingEnabled: !!MST_KEY,
+      mstCreditsUsed: mstStats.creditsUsed
     }));
     return;
   }

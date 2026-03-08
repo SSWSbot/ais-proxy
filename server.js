@@ -12,6 +12,7 @@ const BBOX = [[47.0, -126.5], [51.0, -121.5]];
 const MST_KEY = process.env.MST_API_KEY || "";
 const MST_POLL_INTERVAL_MS = 5 * 60 * 1000;   // Poll every 5 minutes
 const MST_STALE_THRESHOLD_MS = 15 * 60 * 1000; // Only poll MMSIs not seen by AISstream in 15 min
+const MST_DATA_MAX_AGE_MS = 12 * 60 * 60 * 1000; // Skip re-polling vessels whose MST data is older than 12h
 const MST_BATCH_SIZE = 100;                     // Max MMSIs per MyShipTracking bulk request
 
 // ── WW Fleet MMSI list (mirrored from frontend for diagnostics) ──
@@ -146,6 +147,7 @@ function updateCache(raw) {
         heading: heading != null ? heading : null,
         aisClass: aisClass || (prev && prev.aisClass) || null,
         source: "aisstream",
+        dataTimestamp: new Date().toISOString(),
         timestamp: Date.now()
       };
     }
@@ -163,13 +165,26 @@ function updateCache(raw) {
 function getStaleWWMMSIs() {
   const cutoff = Date.now() - MST_STALE_THRESHOLD_MS;
   const stale = [];
+  let skippedOld = 0;
   for (const mmsi in WW_MMSI) {
     const cached = vesselCache[mmsi];
+
+    // If we have MST data and the vessel's AIS timestamp is older than 12h,
+    // it's docked/off — don't waste credits re-polling it
+    if (cached && cached.source === "myshiptracking" && cached.dataTimestamp) {
+      const dataAge = Date.now() - new Date(cached.dataTimestamp).getTime();
+      if (dataAge > MST_DATA_MAX_AGE_MS) {
+        skippedOld++;
+        continue;
+      }
+    }
+
     // Include if: not in cache, OR last update was from MST (keep refreshing), OR AISstream data is stale
     if (!cached || cached.source === "myshiptracking" || cached.timestamp < cutoff) {
       stale.push(mmsi);
     }
   }
+  if (skippedOld > 0) console.log(`MST poll: skipped ${skippedOld} vessels with data older than 12h`);
   return stale;
 }
 
@@ -249,6 +264,7 @@ async function pollMST() {
         const heading = (v.course != null && v.course < 360) ? Math.round(v.course) : null;
         const speed = v.speed != null ? v.speed : null;
         const name = v.vessel_name || WW_MMSI[mmsiStr] || "Unknown";
+        const dataTimestamp = v.received || null; // when MST last received AIS from this vessel
 
         // Update cache
         vesselCache[mmsiStr] = {
@@ -257,6 +273,7 @@ async function pollMST() {
           speed, heading,
           aisClass: "B",
           source: "myshiptracking",
+          dataTimestamp: dataTimestamp,
           timestamp: Date.now()
         };
 
@@ -265,16 +282,18 @@ async function pollMST() {
           name,
           lastSeen: new Date().toISOString(),
           lat, lng, speed, heading,
-          mstTimestamp: v.received || null
+          mstTimestamp: dataTimestamp
         };
 
         // Broadcast to browsers as AISstream-format message
+        // Include _dataTimestamp so the frontend knows the actual age of this position
         const syntheticMsg = JSON.stringify({
           MetaData: {
             MMSI: parseInt(mmsiStr),
             latitude: lat,
             longitude: lng,
-            ShipName: name
+            ShipName: name,
+            _dataTimestamp: dataTimestamp
           },
           Message: {
             PositionReport: {

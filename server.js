@@ -335,6 +335,303 @@ if (MST_KEY) {
   console.log("MyShipTracking integration DISABLED — set MST_API_KEY env var to enable");
 }
 
+// ═══════════════════════════════════════════════════
+// ── Automated Sighting Detection (WW Fleet Clustering) ──
+// ═══════════════════════════════════════════════════
+// Watches WW fleet vessels for proximity clustering that suggests a whale sighting.
+// When 2+ WW vessels travel within 1 NM at <10 kn for >10 min, an automated
+// sighting report is pushed to Firebase every 15 minutes.
+
+const FIREBASE_DB_URL = "https://salish-sea-a97ae-default-rtdb.firebaseio.com";
+const CLUSTER_DISTANCE_NM = 1.0;       // max distance between vessels to be "close"
+const CLUSTER_SPEED_MAX_KN = 10;        // vessels must be under this speed
+const CLUSTER_MIN_DURATION_MS = 10 * 60 * 1000;  // 10 minutes before first report
+const CLUSTER_REPORT_INTERVAL_MS = 15 * 60 * 1000; // new report every 15 min
+const CLUSTER_CHECK_INTERVAL_MS = 60 * 1000;       // check every 1 minute
+const CLUSTER_DATA_FRESHNESS_MS = 15 * 60 * 1000;  // vessel data must be <15 min old
+
+// Active cluster tracking: clusterKey → { firstSeen, lastReportTime, vesselMMSIs }
+const activeClusters = {};
+let clusterStats = { checks: 0, clustersDetected: 0, reportsGenerated: 0, lastCheck: null, errors: 0 };
+
+// Haversine distance in nautical miles
+function haversineNm(lat1, lng1, lat2, lng2) {
+  const R = 3440.065; // Earth radius in NM
+  const dLat = (lat2 - lat1) * Math.PI / 180;
+  const dLng = (lng2 - lng1) * Math.PI / 180;
+  const a = Math.sin(dLat/2) * Math.sin(dLat/2)
+    + Math.cos(lat1 * Math.PI/180) * Math.cos(lat2 * Math.PI/180)
+    * Math.sin(dLng/2) * Math.sin(dLng/2);
+  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+}
+
+// Convert heading (0-360) to compass direction string
+function headingToCompass(heading) {
+  if (heading == null || heading < 0 || heading >= 360) return "Milling / No Direction";
+  const dirs = ["N","NE","E","SE","S","SW","W","NW"];
+  const idx = Math.round(heading / 45) % 8;
+  return dirs[idx];
+}
+
+// Average heading from an array of headings (circular mean)
+function averageHeading(headings) {
+  const valid = headings.filter(h => h != null && h >= 0 && h < 360);
+  if (valid.length === 0) return null;
+  let sinSum = 0, cosSum = 0;
+  for (const h of valid) {
+    sinSum += Math.sin(h * Math.PI / 180);
+    cosSum += Math.cos(h * Math.PI / 180);
+  }
+  let avg = Math.atan2(sinSum / valid.length, cosSum / valid.length) * 180 / Math.PI;
+  if (avg < 0) avg += 360;
+  return Math.round(avg);
+}
+
+// Compute centroid of a group of vessels
+function clusterCenter(vessels) {
+  let latSum = 0, lngSum = 0;
+  for (const v of vessels) { latSum += v.lat; lngSum += v.lng; }
+  return { lat: latSum / vessels.length, lng: lngSum / vessels.length };
+}
+
+// Generate a stable cluster key from sorted MMSIs
+function clusterKey(mmsis) {
+  return [...mmsis].sort().join("+");
+}
+
+// Push data to Firebase Realtime Database via REST API
+function pushToFirebase(path, data) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${FIREBASE_DB_URL}/${path}.json`);
+    const postData = JSON.stringify(data);
+    const options = {
+      method: "POST",
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(body)); } catch(e) { resolve(body); }
+        } else {
+          reject(new Error(`Firebase REST ${res.statusCode}: ${body.slice(0, 300)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// Generate a static map image URL showing vessel positions (CARTO tiles via staticmap service)
+function generateStaticMapUrl(center, vessels) {
+  // Use OpenStreetMap's static map service
+  const zoom = 13;
+  const w = 400, h = 250;
+  // Build marker params for each vessel
+  const markerParts = vessels.map(v =>
+    `${v.lat},${v.lng},ol-marker`
+  ).join("|");
+  // Primary static map URL (openstreetmap.de service)
+  return `https://staticmap.openstreetmap.de/staticmap.php?center=${center.lat},${center.lng}&zoom=${zoom}&size=${w}x${h}&markers=${encodeURIComponent(markerParts)}&maptype=mapnik`;
+}
+
+// Get WW fleet vessels that are "underway" with fresh data
+function getUnderwayWWVessels() {
+  const cutoff = Date.now() - CLUSTER_DATA_FRESHNESS_MS;
+  const vessels = [];
+  for (const mmsi in WW_MMSI) {
+    const v = vesselCache[mmsi];
+    if (!v) continue;
+    if (v.timestamp < cutoff) continue;            // data too old
+    if (v.speed == null) continue;                  // no speed data
+    if (v.speed <= 0.3) continue;                   // essentially stationary / docked
+    if (v.speed >= CLUSTER_SPEED_MAX_KN) continue;  // too fast
+    if (!v.lat || !v.lng) continue;
+    vessels.push({
+      mmsi: mmsi,
+      name: WW_MMSI[mmsi] || v.name || "Unknown",
+      lat: v.lat,
+      lng: v.lng,
+      speed: v.speed,
+      heading: v.heading
+    });
+  }
+  return vessels;
+}
+
+// Find connected components of vessels within CLUSTER_DISTANCE_NM
+function findClusters(vessels) {
+  const n = vessels.length;
+  if (n < 2) return [];
+
+  // Build adjacency: vessels within 1 NM of each other
+  const adj = Array.from({length: n}, () => []);
+  for (let i = 0; i < n; i++) {
+    for (let j = i+1; j < n; j++) {
+      const dist = haversineNm(vessels[i].lat, vessels[i].lng, vessels[j].lat, vessels[j].lng);
+      if (dist <= CLUSTER_DISTANCE_NM) {
+        adj[i].push(j);
+        adj[j].push(i);
+      }
+    }
+  }
+
+  // BFS to find connected components
+  const visited = new Set();
+  const clusters = [];
+  for (let i = 0; i < n; i++) {
+    if (visited.has(i)) continue;
+    if (adj[i].length === 0) continue; // isolated vessel
+    const component = [];
+    const queue = [i];
+    visited.add(i);
+    while (queue.length > 0) {
+      const cur = queue.shift();
+      component.push(cur);
+      for (const nb of adj[cur]) {
+        if (!visited.has(nb)) {
+          visited.add(nb);
+          queue.push(nb);
+        }
+      }
+    }
+    if (component.length >= 2) {
+      clusters.push(component.map(idx => vessels[idx]));
+    }
+  }
+  return clusters;
+}
+
+// Create an automated sighting report in Firebase
+async function createAutoSightingReport(clusterVessels) {
+  const center = clusterCenter(clusterVessels);
+  const headings = clusterVessels.map(v => v.heading);
+  const avgHeading = averageHeading(headings);
+  const direction = headingToCompass(avgHeading);
+  const vesselNames = clusterVessels.map(v => v.name).join(", ");
+  const mapUrl = generateStaticMapUrl(center, clusterVessels);
+
+  const sighting = {
+    lat: center.lat,
+    lng: center.lng,
+    species: "unknown_species",
+    count: "Unknown",
+    direction: direction,
+    behaviour: "Unknown",
+    source: "Automated Sighting Report. Confirmation needed",
+    id: null,
+    notes: "Automated report via AIS. Confirmation needed.\nVessels in cluster: " + vesselNames
+      + "\nAvg heading: " + (avgHeading != null ? avgHeading + "°" : "N/A")
+      + "\nSpeeds: " + clusterVessels.map(v => v.name + " " + (v.speed != null ? v.speed.toFixed(1) : "?") + "kn").join(", "),
+    photo: mapUrl,
+    user: "AIS",
+    uid: "ais-auto",
+    timestamp: Date.now(),
+    sightingTime: Date.now(),
+    gpsLat: null,
+    gpsLng: null,
+    // Extra data for enhanced mini-map rendering
+    _automated: true,
+    _clusterVessels: clusterVessels.map(v => ({
+      mmsi: v.mmsi,
+      name: v.name,
+      lat: v.lat,
+      lng: v.lng,
+      speed: v.speed,
+      heading: v.heading
+    }))
+  };
+
+  try {
+    const result = await pushToFirebase("sightings", sighting);
+    console.log(`AUTO SIGHTING: Created report at ${center.lat.toFixed(4)},${center.lng.toFixed(4)} — ${clusterVessels.length} vessels: ${vesselNames}`);
+    clusterStats.reportsGenerated++;
+
+    // Also push a chat notification
+    await pushToFirebase("chat", {
+      text: `Automated AIS Alert: ${clusterVessels.length} WW vessels clustered near ${center.lat.toFixed(3)}°N, ${Math.abs(center.lng).toFixed(3)}°W — ${vesselNames}. Possible sighting — confirmation needed.`,
+      user: "AIS Monitor",
+      uid: "system",
+      timestamp: Date.now()
+    }).catch(() => {}); // best-effort
+
+    return result;
+  } catch(e) {
+    clusterStats.errors++;
+    console.error("AUTO SIGHTING ERROR:", e.message);
+    return null;
+  }
+}
+
+// Main cluster check routine — runs every CLUSTER_CHECK_INTERVAL_MS
+function checkForClusters() {
+  clusterStats.checks++;
+  clusterStats.lastCheck = new Date().toISOString();
+
+  const underwayVessels = getUnderwayWWVessels();
+  const clusters = findClusters(underwayVessels);
+
+  // Track which existing cluster keys are still active
+  const currentKeys = new Set();
+
+  for (const cluster of clusters) {
+    const mmsis = cluster.map(v => v.mmsi);
+    const key = clusterKey(mmsis);
+    currentKeys.add(key);
+
+    if (!activeClusters[key]) {
+      // New cluster detected — start tracking
+      activeClusters[key] = {
+        firstSeen: Date.now(),
+        lastReportTime: 0,
+        vesselMMSIs: mmsis
+      };
+      console.log(`CLUSTER DETECTED: ${cluster.map(v => v.name).join(", ")} — monitoring for ${CLUSTER_MIN_DURATION_MS/60000} min`);
+      clusterStats.clustersDetected++;
+    }
+
+    const c = activeClusters[key];
+    const age = Date.now() - c.firstSeen;
+    const sinceLast = Date.now() - c.lastReportTime;
+
+    // Has the cluster been active long enough?
+    if (age >= CLUSTER_MIN_DURATION_MS) {
+      // Time for a report? (first report, or 15 min since last)
+      if (c.lastReportTime === 0 || sinceLast >= CLUSTER_REPORT_INTERVAL_MS) {
+        c.lastReportTime = Date.now();
+        createAutoSightingReport(cluster).catch(e => {
+          console.error("Auto sighting report failed:", e.message);
+        });
+      }
+    }
+  }
+
+  // Clean up clusters that no longer exist
+  for (const key in activeClusters) {
+    if (!currentKeys.has(key)) {
+      const c = activeClusters[key];
+      const duration = ((Date.now() - c.firstSeen) / 60000).toFixed(1);
+      console.log(`CLUSTER ENDED: ${c.vesselMMSIs.map(m => WW_MMSI[m] || m).join(", ")} — lasted ${duration} min`);
+      delete activeClusters[key];
+    }
+  }
+}
+
+// Start cluster monitoring after server is up (delay 2 min to let AIS data accumulate)
+setTimeout(() => {
+  console.log("Automated sighting detection STARTED — checking every " + (CLUSTER_CHECK_INTERVAL_MS/1000) + "s");
+  checkForClusters(); // initial check
+  setInterval(checkForClusters, CLUSTER_CHECK_INTERVAL_MS);
+}, 2 * 60 * 1000);
+
 // ── HTTP server ──
 const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -394,6 +691,15 @@ const server = http.createServer((req, res) => {
         pollIntervalMin: MST_POLL_INTERVAL_MS / 60000,
         ...mstStats
       },
+      autoSighting: {
+        activeClusters: Object.keys(activeClusters).length,
+        activeClusterDetails: Object.entries(activeClusters).map(([key, c]) => ({
+          vessels: c.vesselMMSIs.map(m => WW_MMSI[m] || m),
+          ageMinutes: ((Date.now() - c.firstSeen) / 60000).toFixed(1),
+          lastReport: c.lastReportTime ? new Date(c.lastReportTime).toISOString() : "none yet"
+        })),
+        ...clusterStats
+      },
       wwFleet: {
         total: wwTotal,
         seen: wwSeenList.length,
@@ -421,7 +727,9 @@ const server = http.createServer((req, res) => {
       wwTotal: Object.keys(WW_MMSI).length,
       upstreamConnected: upstream && upstream.readyState === WebSocket.OPEN,
       myShipTrackingEnabled: !!MST_KEY,
-      mstCreditsUsed: mstStats.creditsUsed
+      mstCreditsUsed: mstStats.creditsUsed,
+      activeClusters: Object.keys(activeClusters).length,
+      autoReportsGenerated: clusterStats.reportsGenerated
     }));
     return;
   }

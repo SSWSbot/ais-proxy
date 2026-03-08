@@ -6,12 +6,53 @@ const AIS_URL = "wss://stream.aisstream.io/v0/stream";
 const API_KEY = "3e9c100a314a16a7df2a9364b1a7f8cfa775e478";
 const BBOX = [[47.0, -126.5], [51.0, -121.5]];
 
-// ── Vessel position cache ──
-// Key = MMSI string, Value = { mmsi, lat, lng, name, speed, heading, timestamp }
-const vesselCache = {};
-const CACHE_TTL_MS = 30 * 60 * 1000; // Drop vessels not seen in 30 minutes
+// ── WW Fleet MMSI list (mirrored from frontend for diagnostics) ──
+const WW_MMSI = {
+  "369264000":"ISLAND EXPLORER 5","368023510":"SARATOGA","338519000":"SWIFTSURE",
+  "367156000":"CHILKAT EXPRESS","367121000":"GLACIER SPIRIT","316039686":"SALISH SEA ECLIPSE",
+  "366889850":"RED HEAD","316034816":"WILD 4 WHALES","316042213":"SALISH SEA FREEDOM",
+  "368026630":"WESTERN EXPLORER II","316032858":"SALISH SEA DREAM","316008046":"EXPLORATHOR II",
+  "338576000":"OSPREY","367784930":"BLACKFISH IV","316008045":"EXPLORATHOR EXPRESS",
+  "367524220":"BLACKFISH II","316042661":"KULA","316028179":"4 EVER WILD",
+  "316036809":"CASCADIA","367091440":"VICTORIA STAR 2","316018618":"ORCA SPIRIT II",
+  "367014000":"KESTREL","367742760":"J1","367351090":"ODYSSEY",
+  "368032220":"J2","338191000":"SEA LION","316007107":"GOLDWING",
+  "316035167":"STRIDER I","368616000":"BLACKFISH VI","367679710":"BLACKFISH",
+  "316004449":"THE EMPRESS","316010956":"PACIFIC EXPLORER I","368295070":"SOUNDER",
+  "316032442":"JING YU","316009175":"SONIC","316040366":"AURORA II",
+  "316034894":"EAGLE EYES","368355000":"PELAGIC II","316008331":"OCEAN MAGIC II",
+  "338562000":"WESTERN PRINCE II","316029172":"ORCA MIST","369329000":"SALISH EXPRESS",
+  "316006789":"OCEAN MAGIC","316004386":"TAKU","368111540":"PENIEL",
+  "316004458":"QUEEN OF HEARTS","316041693":"SPARTAN01","367395870":"SALISH SEA",
+  "316004946":"MARAUDER IV","316004457":"JESTER","316034303":"SEABREEZE I",
+  "316008708":"KULUTA","316051368":"WILDCAT 4","316008468":"SERENGETI",
+  "367679690":"TRITON","316004641":"FASTTIDE","367631000":"SQUITO",
+  "316005009":"PACIFIC DANCER","316040487":"AURORA I","316004455":"THE COUNTESS",
+  "316007101":"SPY HOPPER","316004448":"HER MAJESTY","316023189":"BC TIKA",
+  "316036225":"KETA","316014609":"LIGHTSHIP 1","316004456":"LADY DI",
+  "316014426":"CRAZY LEGS","316020635":"BC ORCA","367753310":"DFW RESEARCH VESSEL",
+  "316004454":"THE DUCHESS","316041457":"ONYX","316009063":"ACHIEVER",
+  "316039308":"SKANA","316046383":"KLOHOY","316040353":"POSEIDONS CHARIOT",
+  "338203383":"SPIRIT OF ORCA","316006873":"EMERALD MOON","316049389":"PROWLER",
+  "316003689":"KKO","316003705":"FIVE STAR SUPERCAT","316047889":"ECHO",
+  "338209422":"KODIAK","316014948":"TENACIOUS III","316041672":"IKAIKA",
+  "316007866":"TRIPLE 8","316050913":"SPARTAN 2","316006859":"HAISLA EXPLORER",
+  "338470525":"T2","316005064":"ORCA SPIRIT","316049353":"COOPER POINT",
+  "338433231":"GALLIANO","316056299":"CEMORE","316004338":"TRIPLE 8 II",
+  "316004451":"THE MYSTERY","338433228":"BLACKMOUTH"
+};
 
-// Clean stale entries every 5 minutes
+// ── Vessel position cache ──
+const vesselCache = {};
+const CACHE_TTL_MS = 30 * 60 * 1000;
+
+// ── Diagnostics tracking ──
+const messageTypeCounts = {};
+const wwSeen = {};
+let totalMessages = 0;
+let upstreamConnectedAt = null;
+
+// Clean stale cache entries every 5 minutes
 setInterval(() => {
   const cutoff = Date.now() - CACHE_TTL_MS;
   let removed = 0;
@@ -39,10 +80,17 @@ function updateCache(raw) {
     let lng = meta.longitude || meta.Longitude;
     let name = (meta.ShipName || meta.ship_name || "").trim();
     let speed = null, heading = null;
-    let aisClass = null; // "A" or "B"
+    let aisClass = null;
+    let msgType = null;
 
     if (msg.Message) {
-      // Detect AIS class from which position report key is present
+      // Track every message type we receive from AISstream
+      const msgKeys = Object.keys(msg.Message);
+      msgKeys.forEach(k => {
+        msgType = msgType || k;
+        messageTypeCounts[k] = (messageTypeCounts[k] || 0) + 1;
+      });
+
       let p = {};
       if (msg.Message.PositionReport) {
         p = msg.Message.PositionReport;
@@ -56,15 +104,30 @@ function updateCache(raw) {
       if (p.Longitude != null) lng = p.Longitude;
       if (p.Sog != null) speed = p.Sog;
       if (p.TrueHeading != null && p.TrueHeading < 360) heading = p.TrueHeading;
-      // Class B often uses Cog instead of TrueHeading
       if (heading == null && p.Cog != null && p.Cog < 360) heading = Math.round(p.Cog);
 
       const s = msg.Message.ShipStaticData || {};
       if (s.Name) name = s.Name.trim();
     }
 
+    // ── WW Fleet tracking ──
+    if (WW_MMSI[mmsiStr]) {
+      const isFirst = !wwSeen[mmsiStr];
+      wwSeen[mmsiStr] = {
+        name: name || WW_MMSI[mmsiStr],
+        lastSeen: new Date().toISOString(),
+        aisClass: aisClass || (wwSeen[mmsiStr] && wwSeen[mmsiStr].aisClass) || null,
+        msgType: msgType,
+        lat: lat || null,
+        lng: lng || null,
+        count: ((wwSeen[mmsiStr] && wwSeen[mmsiStr].count) || 0) + 1
+      };
+      if (isFirst) {
+        console.log(`WW FLEET SPOTTED: ${WW_MMSI[mmsiStr]} (${mmsiStr}) class=${aisClass} type=${msgType} pos=${lat},${lng}`);
+      }
+    }
+
     if (lat && lng) {
-      // Preserve aisClass from previous update if this message doesn't have one
       const prev = vesselCache[mmsiStr];
       vesselCache[mmsiStr] = {
         mmsi: mmsiStr,
@@ -80,9 +143,8 @@ function updateCache(raw) {
   }
 }
 
-// ── HTTP server with /api/vessels endpoint ──
+// ── HTTP server ──
 const server = http.createServer((req, res) => {
-  // CORS headers so the browser allows the request
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -101,12 +163,54 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Health check (also useful for UptimeRobot pings to prevent cold starts)
+  // ── DIAGNOSTIC ENDPOINT ──
+  if (req.method === "GET" && req.url === "/api/debug") {
+    const wwTotal = Object.keys(WW_MMSI).length;
+    const wwSeenList = [];
+    const wwMissingList = [];
+
+    for (const mmsi in WW_MMSI) {
+      if (wwSeen[mmsi]) {
+        wwSeenList.push({ mmsi, name: WW_MMSI[mmsi], ...wwSeen[mmsi] });
+      } else {
+        wwMissingList.push({ mmsi, name: WW_MMSI[mmsi] });
+      }
+    }
+
+    wwSeenList.sort((a, b) => (b.lastSeen || "").localeCompare(a.lastSeen || ""));
+    wwMissingList.sort((a, b) => a.name.localeCompare(b.name));
+
+    const result = {
+      summary: {
+        totalMessagesReceived: totalMessages,
+        uniqueVesselsInCache: Object.keys(vesselCache).length,
+        upstreamConnected: upstream && upstream.readyState === WebSocket.OPEN,
+        upstreamConnectedAt: upstreamConnectedAt,
+        uptimeMinutes: upstreamConnectedAt ? Math.round((Date.now() - new Date(upstreamConnectedAt).getTime()) / 60000) : null
+      },
+      messageTypes: messageTypeCounts,
+      wwFleet: {
+        total: wwTotal,
+        seen: wwSeenList.length,
+        missing: wwMissingList.length,
+        seenVessels: wwSeenList,
+        missingVessels: wwMissingList
+      }
+    };
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  // Health check
   if (req.method === "GET" && (req.url === "/" || req.url === "/health")) {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify({
       status: "ok",
       vessels: Object.keys(vesselCache).length,
+      wwSeen: Object.keys(wwSeen).length,
+      wwTotal: Object.keys(WW_MMSI).length,
       upstreamConnected: upstream && upstream.readyState === WebSocket.OPEN
     }));
     return;
@@ -121,13 +225,13 @@ const wss = new WebSocket.Server({ server });
 
 server.listen(PORT, () => {
   console.log(`AIS Proxy listening on port ${PORT}`);
-  connectUpstream(); // Start the shared upstream connection on boot
+  console.log(`WW Fleet: tracking ${Object.keys(WW_MMSI).length} vessels`);
+  connectUpstream();
 });
 
 // ── Shared upstream AIS connection ──
 let upstream = null;
 let upstreamRetries = 0;
-let msgCount = 0;
 
 function connectUpstream() {
   console.log("Connecting to upstream AIS...");
@@ -135,12 +239,12 @@ function connectUpstream() {
 
   upstream.on("open", () => {
     upstreamRetries = 0;
-    msgCount = 0;
+    totalMessages = 0;
+    upstreamConnectedAt = new Date().toISOString();
     console.log("Upstream open — sending subscription");
     const sub = {
       Apikey: API_KEY,
       BoundingBoxes: [BBOX]
-      // No FilterMessageTypes — receive ALL types (Class A, Class B, Static, etc.)
     };
     console.log("Subscription:", JSON.stringify(sub));
     upstream.send(JSON.stringify(sub));
@@ -148,19 +252,20 @@ function connectUpstream() {
 
   upstream.on("message", (data) => {
     const raw = data.toString();
-    msgCount++;
+    totalMessages++;
 
-    // Log first 3 messages for debugging
-    if (msgCount <= 3) {
-      console.log(`Upstream msg #${msgCount}:`, raw.slice(0, 300));
-    } else if (msgCount === 4) {
-      console.log("Data flowing normally — suppressing further logs");
+    if (totalMessages <= 5) {
+      console.log(`Upstream msg #${totalMessages}:`, raw.slice(0, 400));
+    } else if (totalMessages === 6) {
+      console.log("Data flowing — check /api/debug for diagnostics.");
     }
 
-    // Update the vessel cache
+    if (totalMessages % 1000 === 0) {
+      console.log(`${totalMessages} msgs | Cache: ${Object.keys(vesselCache).length} vessels | WW seen: ${Object.keys(wwSeen).length}/${Object.keys(WW_MMSI).length} | Types: ${JSON.stringify(messageTypeCounts)}`);
+    }
+
     updateCache(raw);
 
-    // Broadcast to all connected browser clients
     wss.clients.forEach((client) => {
       if (client.readyState === WebSocket.OPEN) {
         client.send(raw);
@@ -178,13 +283,12 @@ function connectUpstream() {
 
   upstream.on("error", (e) => {
     console.error("Upstream error:", e.message);
-    // onclose will fire after this and handle reconnection
   });
 }
 
 // ── Browser client connections ──
 wss.on("connection", (client) => {
-  console.log(`Browser connected (${wss.clients.size} total, cache: ${Object.keys(vesselCache).length} vessels)`);
+  console.log(`Browser connected (${wss.clients.size} total, cache: ${Object.keys(vesselCache).length} vessels, WW seen: ${Object.keys(wwSeen).length})`);
 
   client.on("close", () => {
     console.log(`Browser disconnected (${wss.clients.size} remaining)`);

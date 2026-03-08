@@ -633,7 +633,7 @@ setTimeout(() => {
 }, 2 * 60 * 1000);
 
 // ── HTTP server ──
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -713,6 +713,110 @@ const server = http.createServer((req, res) => {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result, null, 2));
+    return;
+  }
+
+  // ── TEST CLUSTER ENDPOINT ──
+  // Injects fake WW vessel positions near each other and triggers cluster detection.
+  // Usage: GET /api/test-cluster  (or ?cleanup=1 to remove test data after)
+  if (req.method === "GET" && req.url.startsWith("/api/test-cluster")) {
+    const cleanup = req.url.includes("cleanup=1");
+
+    // Pick 3 real WW fleet MMSIs to simulate
+    const testMMSIs = ["316034816", "316042213", "316032858"]; // WILD 4 WHALES, SALISH SEA FREEDOM, SALISH SEA DREAM
+    const testCenter = { lat: 48.5155, lng: -123.0075 }; // Off San Juan Island
+
+    // Save originals so we can restore them
+    const originals = {};
+    for (const mmsi of testMMSIs) {
+      originals[mmsi] = vesselCache[mmsi] ? { ...vesselCache[mmsi] } : null;
+    }
+
+    // Inject fake positions: 3 vessels ~0.3 NM apart, all going ~5 kn heading NW
+    const offsets = [
+      { dLat: 0.0,    dLng: 0.0,    speed: 4.8, heading: 315 },
+      { dLat: 0.003,  dLng: -0.002, speed: 5.2, heading: 310 },
+      { dLat: -0.002, dLng: 0.003,  speed: 4.5, heading: 320 }
+    ];
+
+    for (let i = 0; i < testMMSIs.length; i++) {
+      const mmsi = testMMSIs[i];
+      const o = offsets[i];
+      vesselCache[mmsi] = {
+        mmsi: mmsi,
+        lat: testCenter.lat + o.dLat,
+        lng: testCenter.lng + o.dLng,
+        name: WW_MMSI[mmsi] || "Test Vessel",
+        speed: o.speed,
+        heading: o.heading,
+        aisClass: "B",
+        source: "test-cluster",
+        dataTimestamp: new Date().toISOString(),
+        timestamp: Date.now()
+      };
+    }
+
+    // Force-create a cluster entry that's already been tracking for 11 min
+    // (past the 10-min threshold) so the report fires immediately
+    const key = clusterKey(testMMSIs);
+    activeClusters[key] = {
+      firstSeen: Date.now() - (CLUSTER_MIN_DURATION_MS + 60000), // 11 min ago
+      lastReportTime: 0,
+      vesselMMSIs: testMMSIs
+    };
+
+    // Run cluster check — this will detect the cluster and create the sighting
+    let reportResult = null;
+    try {
+      // Directly create the report instead of relying on async checkForClusters
+      const clusterVessels = testMMSIs.map(mmsi => ({
+        mmsi,
+        name: WW_MMSI[mmsi] || "Test Vessel",
+        lat: vesselCache[mmsi].lat,
+        lng: vesselCache[mmsi].lng,
+        speed: vesselCache[mmsi].speed,
+        heading: vesselCache[mmsi].heading
+      }));
+
+      reportResult = await createAutoSightingReport(clusterVessels);
+      activeClusters[key].lastReportTime = Date.now();
+    } catch(e) {
+      reportResult = { error: e.message };
+    }
+
+    // Optionally clean up: restore original cache entries & remove cluster
+    if (cleanup) {
+      for (const mmsi of testMMSIs) {
+        if (originals[mmsi]) {
+          vesselCache[mmsi] = originals[mmsi];
+        } else {
+          delete vesselCache[mmsi];
+        }
+      }
+      delete activeClusters[key];
+    }
+
+    const response = {
+      success: true,
+      message: "Test cluster injected and sighting report created",
+      testVessels: testMMSIs.map(mmsi => ({
+        mmsi,
+        name: WW_MMSI[mmsi],
+        lat: vesselCache[mmsi] ? vesselCache[mmsi].lat : "cleaned up",
+        lng: vesselCache[mmsi] ? vesselCache[mmsi].lng : "cleaned up",
+        speed: vesselCache[mmsi] ? vesselCache[mmsi].speed : null
+      })),
+      clusterKey: key,
+      clusterActive: !!activeClusters[key],
+      firebaseResult: reportResult,
+      cleanup: cleanup,
+      hint: cleanup
+        ? "Test data cleaned up. Check your app — the sighting should appear on the map."
+        : "Test data still in cache. Call /api/test-cluster?cleanup=1 to remove, or it will expire naturally."
+    };
+
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(response, null, 2));
     return;
   }
 

@@ -348,15 +348,53 @@ const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "";
 const FB_BOT_EMAIL = process.env.FB_BOT_EMAIL || "";
 const FB_BOT_PASSWORD = process.env.FB_BOT_PASSWORD || "";
 const CLUSTER_DISTANCE_NM = 1.0;       // max distance between vessels to be "close"
+const CLUSTER_SPEED_MIN_KN = 0.5;       // min speed — below this = docked/stationary
 const CLUSTER_SPEED_MAX_KN = 10;        // vessels must be under this speed
+const CLUSTER_MAX_HEADING_SPREAD = 60;  // max degrees spread between vessel headings
 const CLUSTER_MIN_DURATION_MS = 10 * 60 * 1000;  // 10 minutes before first report
 const CLUSTER_REPORT_INTERVAL_MS = 15 * 60 * 1000; // new report every 15 min
 const CLUSTER_CHECK_INTERVAL_MS = 60 * 1000;       // check every 1 minute
 const CLUSTER_DATA_FRESHNESS_MS = 15 * 60 * 1000;  // vessel data must be <15 min old
 
+// ── Harbor Exclusion Zones ──
+// Clusters whose center falls inside any of these zones are ignored.
+// {name, lat, lng, radiusNm}
+const HARBOR_ZONES = [
+  // ── San Juan Islands (US) ──
+  {name: "Friday Harbor",           lat: 48.5343, lng: -123.0171, radiusNm: 0.5},
+  {name: "Roche Harbor",            lat: 48.6108, lng: -123.1524, radiusNm: 0.5},
+  {name: "Deer Harbor",             lat: 48.6310, lng: -123.0050, radiusNm: 0.4},
+  // ── Washington State ──
+  {name: "Anacortes",               lat: 48.5126, lng: -122.6127, radiusNm: 0.6},
+  {name: "Bellingham",              lat: 48.7205, lng: -122.5015, radiusNm: 0.75},
+  {name: "Port Townsend",           lat: 48.1170, lng: -122.7594, radiusNm: 0.5},
+  {name: "Edmonds",                 lat: 47.8107, lng: -122.3838, radiusNm: 0.5},
+  {name: "Port Angeles",            lat: 48.1184, lng: -123.4328, radiusNm: 0.5},
+  {name: "Seattle Pier 69",         lat: 47.6128, lng: -122.3530, radiusNm: 0.5},
+  // ── Greater Victoria (BC) ──
+  {name: "Victoria Inner Harbour",  lat: 48.4225, lng: -123.3694, radiusNm: 0.5},
+  {name: "Fishermans Wharf Victoria",lat: 48.4195, lng: -123.3820, radiusNm: 0.4},
+  {name: "Oak Bay",                 lat: 48.4265, lng: -123.3050, radiusNm: 0.4},
+  {name: "Pedder Bay",              lat: 48.3325, lng: -123.5564, radiusNm: 0.4},
+  {name: "Sooke",                   lat: 48.3742, lng: -123.7262, radiusNm: 0.5},
+  {name: "Sidney",                  lat: 48.6505, lng: -123.3960, radiusNm: 0.5},
+  // ── Gulf Islands / Strait of Georgia (BC) ──
+  {name: "Ganges Harbour",          lat: 48.8543, lng: -123.5028, radiusNm: 0.4},
+  {name: "Cowichan Bay",            lat: 48.7440, lng: -123.6150, radiusNm: 0.4},
+  {name: "Maple Bay",               lat: 48.8110, lng: -123.6000, radiusNm: 0.4},
+  {name: "Nanaimo",                 lat: 49.1666, lng: -123.9345, radiusNm: 0.6},
+  // ── Metro Vancouver (BC) ──
+  {name: "Steveston",               lat: 49.1244, lng: -123.1869, radiusNm: 0.5},
+  {name: "Granville Island",        lat: 49.2712, lng: -123.1340, radiusNm: 0.5},
+  {name: "Coal Harbour Vancouver",  lat: 49.2900, lng: -123.1200, radiusNm: 0.5},
+  // ── North Vancouver Island (BC) ──
+  {name: "Campbell River",          lat: 50.0239, lng: -125.2476, radiusNm: 0.5},
+  {name: "Telegraph Cove",          lat: 50.5361, lng: -126.8324, radiusNm: 0.4},
+];
+
 // Active cluster tracking: clusterKey → { firstSeen, lastReportTime, vesselMMSIs }
 const activeClusters = {};
-let clusterStats = { checks: 0, clustersDetected: 0, reportsGenerated: 0, lastCheck: null, errors: 0 };
+let clusterStats = { checks: 0, clustersDetected: 0, reportsGenerated: 0, dismissedHarbor: 0, dismissedHeading: 0, lastCheck: null, errors: 0 };
 
 // ── Firebase Auth (bot account) ──
 // Signs in via the Firebase Auth REST API to get an ID token for database writes.
@@ -481,6 +519,32 @@ function clusterKey(mmsis) {
   return [...mmsis].sort().join("+");
 }
 
+// Check if a point falls inside any harbor exclusion zone
+function isInHarborZone(lat, lng) {
+  for (const hz of HARBOR_ZONES) {
+    const dist = haversineNm(lat, lng, hz.lat, hz.lng);
+    if (dist <= hz.radiusNm) return hz.name;
+  }
+  return null; // not in any harbor
+}
+
+// Calculate the angular spread of a set of headings (smallest arc containing all)
+// Returns degrees (0-180). If headings are missing, returns 999 (= skip filter).
+function headingSpread(headings) {
+  const valid = headings.filter(h => h != null && h >= 0 && h < 360);
+  if (valid.length < 2) return 999; // not enough data to filter
+  // Sort headings and find the largest gap between consecutive headings
+  const sorted = [...valid].sort((a, b) => a - b);
+  let maxGap = 0;
+  for (let i = 1; i < sorted.length; i++) {
+    maxGap = Math.max(maxGap, sorted[i] - sorted[i-1]);
+  }
+  // Wrap-around gap
+  maxGap = Math.max(maxGap, (360 - sorted[sorted.length-1]) + sorted[0]);
+  // The spread is 360 minus the largest gap
+  return 360 - maxGap;
+}
+
 // Push data to Firebase Realtime Database via REST API (authenticated)
 async function pushToFirebase(path, data) {
   const token = await ensureFirebaseAuth();
@@ -522,7 +586,7 @@ function getUnderwayWWVessels() {
     if (!v) continue;
     if (v.timestamp < cutoff) continue;            // data too old
     if (v.speed == null) continue;                  // no speed data
-    if (v.speed <= 0.3) continue;                   // essentially stationary / docked
+    if (v.speed <= CLUSTER_SPEED_MIN_KN) continue;    // essentially stationary / docked
     if (v.speed >= CLUSTER_SPEED_MAX_KN) continue;  // too fast
     if (!v.lat || !v.lng) continue;
     vessels.push({
@@ -652,6 +716,31 @@ function checkForClusters() {
   for (const cluster of clusters) {
     const mmsis = cluster.map(v => v.mmsi);
     const key = clusterKey(mmsis);
+
+    // ── Filter 1: Harbor exclusion ──
+    const center = clusterCenter(cluster);
+    const harbor = isInHarborZone(center.lat, center.lng);
+    if (harbor) {
+      // If we were tracking this cluster, remove it
+      if (activeClusters[key]) {
+        console.log(`CLUSTER DISMISSED (harbor: ${harbor}): ${cluster.map(v => v.name).join(", ")}`);
+        delete activeClusters[key];
+      }
+      clusterStats.dismissedHarbor++;
+      continue;
+    }
+
+    // ── Filter 2: Heading spread — vessels must be travelling in roughly same direction ──
+    const spread = headingSpread(cluster.map(v => v.heading));
+    if (spread > CLUSTER_MAX_HEADING_SPREAD) {
+      if (activeClusters[key]) {
+        console.log(`CLUSTER DISMISSED (heading spread ${spread}°): ${cluster.map(v => v.name).join(", ")}`);
+        delete activeClusters[key];
+      }
+      clusterStats.dismissedHeading++;
+      continue;
+    }
+
     currentKeys.add(key);
 
     if (!activeClusters[key]) {
@@ -764,6 +853,13 @@ const server = http.createServer((req, res) => {
           authenticated: !!firebaseIdToken,
           uid: firebaseUid || null,
           tokenValid: firebaseIdToken && Date.now() < firebaseTokenExpiry
+        },
+        filters: {
+          minSpeedKn: CLUSTER_SPEED_MIN_KN,
+          maxSpeedKn: CLUSTER_SPEED_MAX_KN,
+          maxDistanceNm: CLUSTER_DISTANCE_NM,
+          maxHeadingSpread: CLUSTER_MAX_HEADING_SPREAD,
+          harborZones: HARBOR_ZONES.length
         },
         activeClusters: Object.keys(activeClusters).length,
         activeClusterDetails: Object.entries(activeClusters).map(([key, c]) => ({

@@ -513,19 +513,6 @@ async function pushToFirebase(path, data) {
   });
 }
 
-// Generate a static map image URL showing vessel positions (CARTO tiles via staticmap service)
-function generateStaticMapUrl(center, vessels) {
-  // Use OpenStreetMap's static map service
-  const zoom = 13;
-  const w = 400, h = 250;
-  // Build marker params for each vessel
-  const markerParts = vessels.map(v =>
-    `${v.lat},${v.lng},ol-marker`
-  ).join("|");
-  // Primary static map URL (openstreetmap.de service)
-  return `https://staticmap.openstreetmap.de/staticmap.php?center=${center.lat},${center.lng}&zoom=${zoom}&size=${w}x${h}&markers=${encodeURIComponent(markerParts)}&maptype=mapnik`;
-}
-
 // Get WW fleet vessels that are "underway" with fresh data
 function getUnderwayWWVessels() {
   const cutoff = Date.now() - CLUSTER_DATA_FRESHNESS_MS;
@@ -600,7 +587,6 @@ async function createAutoSightingReport(clusterVessels) {
   const avgHeading = averageHeading(headings);
   const direction = headingToCompass(avgHeading);
   const vesselNames = clusterVessels.map(v => v.name).join(", ");
-  const mapUrl = generateStaticMapUrl(center, clusterVessels);
 
   const sighting = {
     lat: center.lat,
@@ -609,12 +595,10 @@ async function createAutoSightingReport(clusterVessels) {
     count: "Unknown",
     direction: direction,
     behaviour: "Unknown",
-    source: "Automated Sighting Report. Confirmation needed",
+    source: "AIS",
     id: null,
-    notes: "Automated report via AIS. Confirmation needed.\nVessels in cluster: " + vesselNames
-      + "\nAvg heading: " + (avgHeading != null ? avgHeading + "°" : "N/A")
-      + "\nSpeeds: " + clusterVessels.map(v => v.name + " " + (v.speed != null ? v.speed.toFixed(1) : "?") + "kn").join(", "),
-    photo: mapUrl,
+    notes: "Automated report via AIS. Confirmation needed.",
+    photo: null,
     user: "AIS",
     uid: firebaseUid || "ais-auto",
     timestamp: Date.now(),
@@ -716,7 +700,7 @@ setTimeout(() => {
 }, 2 * 60 * 1000);
 
 // ── HTTP server ──
-const server = http.createServer(async (req, res) => {
+const server = http.createServer((req, res) => {
   res.setHeader("Access-Control-Allow-Origin", "*");
   res.setHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
@@ -802,137 +786,6 @@ const server = http.createServer(async (req, res) => {
 
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(result, null, 2));
-    return;
-  }
-
-  // ── TEST CLUSTER ENDPOINT ──
-  // Injects fake WW vessel positions near each other and triggers cluster detection.
-  // Usage: GET /api/test-cluster  (or ?cleanup=1 to remove test data after)
-  if (req.method === "GET" && req.url.startsWith("/api/test-cluster")) {
-    const cleanup = req.url.includes("cleanup=1");
-
-    // Pick 3 real WW fleet MMSIs to simulate
-    const testMMSIs = ["316034816", "316042213", "316032858"]; // WILD 4 WHALES, SALISH SEA FREEDOM, SALISH SEA DREAM
-    const testCenter = { lat: 48.5155, lng: -123.0075 }; // Off San Juan Island
-
-    // Save originals so we can restore them
-    const originals = {};
-    for (const mmsi of testMMSIs) {
-      originals[mmsi] = vesselCache[mmsi] ? { ...vesselCache[mmsi] } : null;
-    }
-
-    // Inject fake positions: 3 vessels ~0.3 NM apart, all going ~5 kn heading NW
-    const offsets = [
-      { dLat: 0.0,    dLng: 0.0,    speed: 4.8, heading: 315 },
-      { dLat: 0.003,  dLng: -0.002, speed: 5.2, heading: 310 },
-      { dLat: -0.002, dLng: 0.003,  speed: 4.5, heading: 320 }
-    ];
-
-    for (let i = 0; i < testMMSIs.length; i++) {
-      const mmsi = testMMSIs[i];
-      const o = offsets[i];
-      vesselCache[mmsi] = {
-        mmsi: mmsi,
-        lat: testCenter.lat + o.dLat,
-        lng: testCenter.lng + o.dLng,
-        name: WW_MMSI[mmsi] || "Test Vessel",
-        speed: o.speed,
-        heading: o.heading,
-        aisClass: "B",
-        source: "test-cluster",
-        dataTimestamp: new Date().toISOString(),
-        timestamp: Date.now()
-      };
-    }
-
-    // Force-create a cluster entry that's already been tracking for 11 min
-    // (past the 10-min threshold) so the report fires immediately
-    const key = clusterKey(testMMSIs);
-    activeClusters[key] = {
-      firstSeen: Date.now() - (CLUSTER_MIN_DURATION_MS + 60000), // 11 min ago
-      lastReportTime: 0,
-      vesselMMSIs: testMMSIs
-    };
-
-    // Run cluster check — this will detect the cluster and create the sighting
-    let reportResult = null;
-    let reportError = null;
-    try {
-      // Check auth first
-      if (!FB_BOT_EMAIL || !FB_BOT_PASSWORD) {
-        throw new Error("FB_BOT_EMAIL and FB_BOT_PASSWORD env vars not set. Create a Firebase account for the bot and set these in Render.");
-      }
-      // Ensure we have a valid token
-      await ensureFirebaseAuth();
-      if (!firebaseIdToken) {
-        throw new Error("Firebase auth token is null — sign-in may have failed. Check FB_BOT_EMAIL / FB_BOT_PASSWORD.");
-      }
-
-      // Directly create the report instead of relying on async checkForClusters
-      const clusterVessels = testMMSIs.map(mmsi => ({
-        mmsi,
-        name: WW_MMSI[mmsi] || "Test Vessel",
-        lat: vesselCache[mmsi].lat,
-        lng: vesselCache[mmsi].lng,
-        speed: vesselCache[mmsi].speed,
-        heading: vesselCache[mmsi].heading
-      }));
-
-      reportResult = await createAutoSightingReport(clusterVessels);
-      if (reportResult === null) {
-        reportError = "createAutoSightingReport returned null — check server logs for details";
-      } else {
-        activeClusters[key].lastReportTime = Date.now();
-      }
-    } catch(e) {
-      reportError = e.message;
-    }
-
-    // Optionally clean up: restore original cache entries & remove cluster
-    if (cleanup) {
-      for (const mmsi of testMMSIs) {
-        if (originals[mmsi]) {
-          vesselCache[mmsi] = originals[mmsi];
-        } else {
-          delete vesselCache[mmsi];
-        }
-      }
-      delete activeClusters[key];
-    }
-
-    const response = {
-      success: !reportError,
-      message: reportError
-        ? "Test cluster injected but report FAILED: " + reportError
-        : "Test cluster injected and sighting report created",
-      auth: {
-        botEmail: FB_BOT_EMAIL || "(not set)",
-        botPasswordSet: !!FB_BOT_PASSWORD,
-        firebaseUid: firebaseUid || null,
-        tokenValid: firebaseIdToken && Date.now() < firebaseTokenExpiry,
-        tokenExpiry: firebaseTokenExpiry ? new Date(firebaseTokenExpiry).toISOString() : null
-      },
-      error: reportError || null,
-      testVessels: testMMSIs.map(mmsi => ({
-        mmsi,
-        name: WW_MMSI[mmsi],
-        lat: vesselCache[mmsi] ? vesselCache[mmsi].lat : "cleaned up",
-        lng: vesselCache[mmsi] ? vesselCache[mmsi].lng : "cleaned up",
-        speed: vesselCache[mmsi] ? vesselCache[mmsi].speed : null
-      })),
-      clusterKey: key,
-      clusterActive: !!activeClusters[key],
-      firebaseResult: reportResult,
-      cleanup: cleanup,
-      hint: reportError
-        ? "Fix the error above, redeploy, and try again."
-        : cleanup
-          ? "Test data cleaned up. Check your app — the sighting should appear on the map."
-          : "Test data still in cache. Call /api/test-cluster?cleanup=1 to remove, or it will expire naturally."
-    };
-
-    res.writeHead(200, { "Content-Type": "application/json" });
-    res.end(JSON.stringify(response, null, 2));
     return;
   }
 

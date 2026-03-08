@@ -33,31 +33,45 @@ function updateCache(raw) {
     const meta = msg.MetaData || {};
     const mmsi = meta.MMSI || meta.mmsi;
     if (!mmsi) return;
+    const mmsiStr = String(mmsi);
 
     let lat = meta.latitude || meta.Latitude;
     let lng = meta.longitude || meta.Longitude;
     let name = (meta.ShipName || meta.ship_name || "").trim();
     let speed = null, heading = null;
+    let aisClass = null; // "A" or "B"
 
     if (msg.Message) {
-      const p = msg.Message.PositionReport
-             || msg.Message.StandardClassBCSPositionReport
-             || {};
+      // Detect AIS class from which position report key is present
+      let p = {};
+      if (msg.Message.PositionReport) {
+        p = msg.Message.PositionReport;
+        aisClass = "A";
+      } else if (msg.Message.StandardClassBCSPositionReport) {
+        p = msg.Message.StandardClassBCSPositionReport;
+        aisClass = "B";
+      }
+
       if (p.Latitude  != null) lat = p.Latitude;
       if (p.Longitude != null) lng = p.Longitude;
       if (p.Sog != null) speed = p.Sog;
       if (p.TrueHeading != null && p.TrueHeading < 360) heading = p.TrueHeading;
+      // Class B often uses Cog instead of TrueHeading
+      if (heading == null && p.Cog != null && p.Cog < 360) heading = Math.round(p.Cog);
 
       const s = msg.Message.ShipStaticData || {};
       if (s.Name) name = s.Name.trim();
     }
 
     if (lat && lng) {
-      vesselCache[String(mmsi)] = {
-        mmsi: String(mmsi),
+      // Preserve aisClass from previous update if this message doesn't have one
+      const prev = vesselCache[mmsiStr];
+      vesselCache[mmsiStr] = {
+        mmsi: mmsiStr,
         lat, lng, name,
         speed:   speed   != null ? speed   : null,
         heading: heading != null ? heading : null,
+        aisClass: aisClass || (prev && prev.aisClass) || null,
         timestamp: Date.now()
       };
     }
@@ -125,8 +139,8 @@ function connectUpstream() {
     console.log("Upstream open — sending subscription");
     const sub = {
       Apikey: API_KEY,
-      BoundingBoxes: [BBOX],
-      FilterMessageTypes: ["PositionReport", "StandardClassBCSPositionReport", "ShipStaticData"]
+      BoundingBoxes: [BBOX]
+      // No FilterMessageTypes — receive ALL types (Class A, Class B, Static, etc.)
     };
     console.log("Subscription:", JSON.stringify(sub));
     upstream.send(JSON.stringify(sub));

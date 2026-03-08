@@ -4,7 +4,7 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 8080;
 const AIS_URL = "wss://stream.aisstream.io/v0/stream";
-const API_KEY = "3e9c100a314a16a7df2a9364b1a7f8cfa775e478";
+const API_KEY = process.env.AIS_API_KEY || "";
 const BBOX = [[47.0, -126.5], [51.0, -121.5]];
 
 // ── MyShipTracking config (second AIS source for WW Fleet) ──
@@ -343,7 +343,7 @@ if (MST_KEY) {
 // sighting report is pushed to Firebase every 15 minutes.
 
 const FIREBASE_DB_URL = "https://salish-sea-a97ae-default-rtdb.firebaseio.com";
-const FIREBASE_API_KEY = "AIzaSyDLLmTfsBaLks6XunOKAkOiqhtYqOwnlwY"; // same web API key as frontend
+const FIREBASE_API_KEY = process.env.FIREBASE_API_KEY || "";
 // Set these in Render environment variables — a dedicated "bot" Firebase account for server writes
 const FB_BOT_EMAIL = process.env.FB_BOT_EMAIL || "";
 const FB_BOT_PASSWORD = process.env.FB_BOT_PASSWORD || "";

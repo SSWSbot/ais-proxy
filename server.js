@@ -41,7 +41,7 @@ function updateCache(raw) {
 
     if (msg.Message) {
       const p = msg.Message.PositionReport
-             || msg.Message.StandardClassBPositionReport
+             || msg.Message.StandardClassBCSPositionReport
              || {};
       if (p.Latitude  != null) lat = p.Latitude;
       if (p.Longitude != null) lng = p.Longitude;
@@ -126,7 +126,7 @@ function connectUpstream() {
     const sub = {
       Apikey: API_KEY,
       BoundingBoxes: [BBOX],
-      FilterMessageTypes: ["PositionReport", "ShipStaticData"]
+      FilterMessageTypes: ["PositionReport", "StandardClassBCSPositionReport", "ShipStaticData"]
     };
     console.log("Subscription:", JSON.stringify(sub));
     upstream.send(JSON.stringify(sub));

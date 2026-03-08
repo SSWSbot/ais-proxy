@@ -95,8 +95,8 @@ function updateCache(raw) {
       if (msg.Message.PositionReport) {
         p = msg.Message.PositionReport;
         aisClass = "A";
-      } else if (msg.Message.StandardClassBCSPositionReport) {
-        p = msg.Message.StandardClassBCSPositionReport;
+      } else if (msg.Message.StandardClassBPositionReport) {
+        p = msg.Message.StandardClassBPositionReport;
         aisClass = "B";
       }
 

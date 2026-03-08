@@ -343,6 +343,10 @@ if (MST_KEY) {
 // sighting report is pushed to Firebase every 15 minutes.
 
 const FIREBASE_DB_URL = "https://salish-sea-a97ae-default-rtdb.firebaseio.com";
+const FIREBASE_API_KEY = "AIzaSyDLLmTfsBaLks6XunOKAkOiqhtYqOwnlwY"; // same web API key as frontend
+// Set these in Render environment variables — a dedicated "bot" Firebase account for server writes
+const FB_BOT_EMAIL = process.env.FB_BOT_EMAIL || "";
+const FB_BOT_PASSWORD = process.env.FB_BOT_PASSWORD || "";
 const CLUSTER_DISTANCE_NM = 1.0;       // max distance between vessels to be "close"
 const CLUSTER_SPEED_MAX_KN = 10;        // vessels must be under this speed
 const CLUSTER_MIN_DURATION_MS = 10 * 60 * 1000;  // 10 minutes before first report
@@ -353,6 +357,84 @@ const CLUSTER_DATA_FRESHNESS_MS = 15 * 60 * 1000;  // vessel data must be <15 mi
 // Active cluster tracking: clusterKey → { firstSeen, lastReportTime, vesselMMSIs }
 const activeClusters = {};
 let clusterStats = { checks: 0, clustersDetected: 0, reportsGenerated: 0, lastCheck: null, errors: 0 };
+
+// ── Firebase Auth (bot account) ──
+// Signs in via the Firebase Auth REST API to get an ID token for database writes.
+// Tokens expire after ~1 hour; we refresh every 50 minutes.
+let firebaseIdToken = null;
+let firebaseUid = null;
+let firebaseTokenExpiry = 0;
+
+function firebaseSignIn() {
+  return new Promise((resolve, reject) => {
+    if (!FB_BOT_EMAIL || !FB_BOT_PASSWORD) {
+      reject(new Error("FB_BOT_EMAIL / FB_BOT_PASSWORD not set — cannot authenticate with Firebase"));
+      return;
+    }
+    const postData = JSON.stringify({
+      email: FB_BOT_EMAIL,
+      password: FB_BOT_PASSWORD,
+      returnSecureToken: true
+    });
+    const url = new URL(`https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${FIREBASE_API_KEY}`);
+    const options = {
+      method: "POST",
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(postData)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("end", () => {
+        try {
+          const parsed = JSON.parse(body);
+          if (res.statusCode === 200 && parsed.idToken) {
+            firebaseIdToken = parsed.idToken;
+            firebaseUid = parsed.localId || null;
+            // Token expires in expiresIn seconds (usually 3600)
+            const expiresIn = parseInt(parsed.expiresIn) || 3600;
+            firebaseTokenExpiry = Date.now() + (expiresIn * 1000);
+            console.log(`Firebase auth: signed in as ${FB_BOT_EMAIL} (uid: ${firebaseUid}), token expires in ${expiresIn}s`);
+            resolve(firebaseIdToken);
+          } else {
+            const errMsg = parsed.error ? parsed.error.message : `HTTP ${res.statusCode}`;
+            reject(new Error("Firebase sign-in failed: " + errMsg));
+          }
+        } catch(e) {
+          reject(new Error("Firebase sign-in parse error: " + e.message));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(postData);
+    req.end();
+  });
+}
+
+// Ensure we have a valid token; refresh if expired or about to expire
+async function ensureFirebaseAuth() {
+  if (firebaseIdToken && Date.now() < firebaseTokenExpiry - 5 * 60 * 1000) {
+    return firebaseIdToken; // still valid with 5-min buffer
+  }
+  return await firebaseSignIn();
+}
+
+// Start Firebase auth on boot (if credentials are set)
+if (FB_BOT_EMAIL && FB_BOT_PASSWORD) {
+  firebaseSignIn()
+    .then(() => console.log("Firebase bot auth: READY"))
+    .catch(e => console.error("Firebase bot auth FAILED:", e.message));
+  // Refresh token every 50 minutes
+  setInterval(() => {
+    firebaseSignIn().catch(e => console.error("Firebase token refresh failed:", e.message));
+  }, 50 * 60 * 1000);
+} else {
+  console.log("Firebase bot auth: DISABLED — set FB_BOT_EMAIL and FB_BOT_PASSWORD env vars to enable automated sighting reports");
+}
 
 // Haversine distance in nautical miles
 function haversineNm(lat1, lng1, lat2, lng2) {
@@ -399,10 +481,11 @@ function clusterKey(mmsis) {
   return [...mmsis].sort().join("+");
 }
 
-// Push data to Firebase Realtime Database via REST API
-function pushToFirebase(path, data) {
+// Push data to Firebase Realtime Database via REST API (authenticated)
+async function pushToFirebase(path, data) {
+  const token = await ensureFirebaseAuth();
   return new Promise((resolve, reject) => {
-    const url = new URL(`${FIREBASE_DB_URL}/${path}.json`);
+    const url = new URL(`${FIREBASE_DB_URL}/${path}.json?auth=${token}`);
     const postData = JSON.stringify(data);
     const options = {
       method: "POST",
@@ -533,7 +616,7 @@ async function createAutoSightingReport(clusterVessels) {
       + "\nSpeeds: " + clusterVessels.map(v => v.name + " " + (v.speed != null ? v.speed.toFixed(1) : "?") + "kn").join(", "),
     photo: mapUrl,
     user: "AIS",
-    uid: "ais-auto",
+    uid: firebaseUid || "ais-auto",
     timestamp: Date.now(),
     sightingTime: Date.now(),
     gpsLat: null,
@@ -692,6 +775,12 @@ const server = http.createServer(async (req, res) => {
         ...mstStats
       },
       autoSighting: {
+        firebaseAuth: {
+          botEmail: FB_BOT_EMAIL || "(not set)",
+          authenticated: !!firebaseIdToken,
+          uid: firebaseUid || null,
+          tokenValid: firebaseIdToken && Date.now() < firebaseTokenExpiry
+        },
         activeClusters: Object.keys(activeClusters).length,
         activeClusterDetails: Object.entries(activeClusters).map(([key, c]) => ({
           vessels: c.vesselMMSIs.map(m => WW_MMSI[m] || m),
@@ -767,7 +856,18 @@ const server = http.createServer(async (req, res) => {
 
     // Run cluster check — this will detect the cluster and create the sighting
     let reportResult = null;
+    let reportError = null;
     try {
+      // Check auth first
+      if (!FB_BOT_EMAIL || !FB_BOT_PASSWORD) {
+        throw new Error("FB_BOT_EMAIL and FB_BOT_PASSWORD env vars not set. Create a Firebase account for the bot and set these in Render.");
+      }
+      // Ensure we have a valid token
+      await ensureFirebaseAuth();
+      if (!firebaseIdToken) {
+        throw new Error("Firebase auth token is null — sign-in may have failed. Check FB_BOT_EMAIL / FB_BOT_PASSWORD.");
+      }
+
       // Directly create the report instead of relying on async checkForClusters
       const clusterVessels = testMMSIs.map(mmsi => ({
         mmsi,
@@ -779,9 +879,13 @@ const server = http.createServer(async (req, res) => {
       }));
 
       reportResult = await createAutoSightingReport(clusterVessels);
-      activeClusters[key].lastReportTime = Date.now();
+      if (reportResult === null) {
+        reportError = "createAutoSightingReport returned null — check server logs for details";
+      } else {
+        activeClusters[key].lastReportTime = Date.now();
+      }
     } catch(e) {
-      reportResult = { error: e.message };
+      reportError = e.message;
     }
 
     // Optionally clean up: restore original cache entries & remove cluster
@@ -797,8 +901,18 @@ const server = http.createServer(async (req, res) => {
     }
 
     const response = {
-      success: true,
-      message: "Test cluster injected and sighting report created",
+      success: !reportError,
+      message: reportError
+        ? "Test cluster injected but report FAILED: " + reportError
+        : "Test cluster injected and sighting report created",
+      auth: {
+        botEmail: FB_BOT_EMAIL || "(not set)",
+        botPasswordSet: !!FB_BOT_PASSWORD,
+        firebaseUid: firebaseUid || null,
+        tokenValid: firebaseIdToken && Date.now() < firebaseTokenExpiry,
+        tokenExpiry: firebaseTokenExpiry ? new Date(firebaseTokenExpiry).toISOString() : null
+      },
+      error: reportError || null,
       testVessels: testMMSIs.map(mmsi => ({
         mmsi,
         name: WW_MMSI[mmsi],
@@ -810,9 +924,11 @@ const server = http.createServer(async (req, res) => {
       clusterActive: !!activeClusters[key],
       firebaseResult: reportResult,
       cleanup: cleanup,
-      hint: cleanup
-        ? "Test data cleaned up. Check your app — the sighting should appear on the map."
-        : "Test data still in cache. Call /api/test-cluster?cleanup=1 to remove, or it will expire naturally."
+      hint: reportError
+        ? "Fix the error above, redeploy, and try again."
+        : cleanup
+          ? "Test data cleaned up. Check your app — the sighting should appear on the map."
+          : "Test data still in cache. Call /api/test-cluster?cleanup=1 to remove, or it will expire naturally."
     };
 
     res.writeHead(200, { "Content-Type": "application/json" });

@@ -150,6 +150,11 @@ function updateCache(raw) {
         dataTimestamp: new Date().toISOString(),
         timestamp: Date.now()
       };
+
+      // Server-side Firebase writes for WW fleet (runs 24/7 regardless of browser clients)
+      if (WW_MMSI[mmsiStr]) {
+        serverWriteWWPosition(mmsiStr, { lat, lng, name, speed, heading });
+      }
     }
   } catch (e) {
     // Ignore malformed messages
@@ -284,6 +289,9 @@ async function pollMST() {
           lat, lng, speed, heading,
           mstTimestamp: dataTimestamp
         };
+
+        // Server-side Firebase writes for MST-sourced WW data
+        serverWriteWWPosition(mmsiStr, { lat, lng, name, speed, heading });
 
         // Broadcast to browsers as AISstream-format message
         // Include _dataTimestamp so the frontend knows the actual age of this position
@@ -545,7 +553,7 @@ function headingSpread(headings) {
   return 360 - maxGap;
 }
 
-// Push data to Firebase Realtime Database via REST API (authenticated)
+// Push data to Firebase Realtime Database via REST API (authenticated) — POST (generates key)
 async function pushToFirebase(path, data) {
   const token = await ensureFirebaseAuth();
   return new Promise((resolve, reject) => {
@@ -576,6 +584,138 @@ async function pushToFirebase(path, data) {
     req.end();
   });
 }
+
+// Set data at a specific Firebase path via REST API (authenticated) — PUT (overwrites)
+async function setFirebase(path, data) {
+  const token = await ensureFirebaseAuth();
+  return new Promise((resolve, reject) => {
+    const url = new URL(`${FIREBASE_DB_URL}/${path}.json?auth=${token}`);
+    const putData = JSON.stringify(data);
+    const options = {
+      method: "PUT",
+      hostname: url.hostname,
+      path: url.pathname + url.search,
+      headers: {
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(putData)
+      }
+    };
+    const req = https.request(options, (res) => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          try { resolve(JSON.parse(body)); } catch(e) { resolve(body); }
+        } else {
+          reject(new Error(`Firebase REST PUT ${res.statusCode}: ${body.slice(0, 300)}`));
+        }
+      });
+    });
+    req.on("error", reject);
+    req.write(putData);
+    req.end();
+  });
+}
+
+// ═══ Server-side WW Fleet Position & Track Recording ═══
+// Writes to Firebase 24/7 even when no browser clients are connected.
+
+const wwPositionLastWrite = {};  // {mmsi: timestamp} — throttle position writes (every 60s)
+const wwTrackLastWrite = {};     // {mmsi: timestamp} — throttle track writes (every 60s)
+
+function serverWriteWWPosition(mmsiStr, data) {
+  if (!firebaseIdToken) return; // not authenticated yet
+  const now = Date.now();
+
+  // Throttle: write position at most once per 60 seconds per vessel
+  if (wwPositionLastWrite[mmsiStr] && (now - wwPositionLastWrite[mmsiStr]) < 60000) return;
+  wwPositionLastWrite[mmsiStr] = now;
+
+  const name = WW_MMSI[mmsiStr] || data.name || "Unknown";
+
+  // Write last known position (overwrites previous)
+  setFirebase("vessel_positions/" + mmsiStr, {
+    lat: data.lat, lng: data.lng, name: name,
+    speed: data.speed || null, heading: data.heading || null,
+    timestamp: now
+  }).catch(e => {
+    if (!e.message.includes("401")) console.error("Firebase vessel_positions write error:", e.message);
+  });
+
+  // Write track point (appends)
+  if (!wwTrackLastWrite[mmsiStr] || (now - wwTrackLastWrite[mmsiStr]) >= 60000) {
+    wwTrackLastWrite[mmsiStr] = now;
+    pushToFirebase("vessel_tracks/" + mmsiStr, {
+      lat: data.lat, lng: data.lng,
+      speed: data.speed || 0, heading: data.heading || 0, t: now
+    }).catch(e => {
+      if (!e.message.includes("401")) console.error("Firebase vessel_tracks write error:", e.message);
+    });
+  }
+}
+
+// ═══ Server-side AIS Monitor Snapshots ═══
+// Records hourly coverage stats so the admin dashboard has data even when no one's online.
+
+function recordMonitorSnapshot() {
+  if (!firebaseIdToken) return;
+  const now = Date.now();
+  const mmsiList = Object.keys(WW_MMSI);
+  let live = 0, stale = 0, missing = 0;
+
+  for (const mmsi of mmsiList) {
+    const cached = vesselCache[mmsi];
+    if (!cached || !cached.timestamp) { missing++; continue; }
+    const ageMin = (now - cached.timestamp) / 60000;
+    if (ageMin < 10) live++;
+    else if (ageMin < 60) stale++;
+    else missing++;
+  }
+
+  const hourKey = new Date().toISOString().substring(0, 13).replace(/[^0-9]/g, "");
+  setFirebase("ais_monitor/hourly_snapshots/" + hourKey, {
+    live, stale, missing, total: mmsiList.length, t: now
+  }).catch(e => {
+    if (!e.message.includes("401")) console.error("Firebase monitor snapshot error:", e.message);
+  });
+
+  console.log(`AIS Monitor snapshot: ${live} live, ${stale} stale, ${missing} missing / ${mmsiList.length} total`);
+}
+
+// Record snapshots every hour, starting 5 min after boot
+setTimeout(() => {
+  recordMonitorSnapshot();
+  setInterval(recordMonitorSnapshot, 60 * 60 * 1000);
+}, 5 * 60 * 1000);
+
+// Clean up old track points (>24h) every 6 hours
+setInterval(() => {
+  if (!firebaseIdToken) return;
+  const cutoff = Date.now() - 24 * 60 * 60 * 1000;
+  console.log("Cleaning old track points (>24h)...");
+  for (const mmsi in WW_MMSI) {
+    const url = new URL(`${FIREBASE_DB_URL}/vessel_tracks/${mmsi}.json?auth=${firebaseIdToken}&orderBy="t"&endAt=${cutoff}&limitToFirst=500`);
+    https.get(url.toString(), (res) => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("end", () => {
+        try {
+          const data = JSON.parse(body);
+          if (data && typeof data === "object") {
+            const keys = Object.keys(data);
+            for (const key of keys) {
+              const delUrl = new URL(`${FIREBASE_DB_URL}/vessel_tracks/${mmsi}/${key}.json?auth=${firebaseIdToken}`);
+              const delOpts = { method: "DELETE", hostname: delUrl.hostname, path: delUrl.pathname + delUrl.search };
+              const delReq = https.request(delOpts, () => {});
+              delReq.on("error", () => {});
+              delReq.end();
+            }
+          }
+        } catch(e) {}
+      });
+    }).on("error", () => {});
+  }
+}, 6 * 60 * 60 * 1000);
 
 // Get WW fleet vessels that are "underway" with fresh data
 function getUnderwayWWVessels() {
